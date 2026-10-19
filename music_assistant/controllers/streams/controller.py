@@ -99,6 +99,7 @@ from music_assistant.controllers.streams.constants import (
     OUTCOME_ONLY_NORMALIZATION_MODES,
     BufferSize,
     PacingProfile,
+    flow_pacing_profile,
     get_available_buffer_sizes,
     output_pacing_args,
 )
@@ -1541,8 +1542,11 @@ class StreamsController(CoreController):
             # restarting (or completely failing) the audio stream by keeping the buffer short.
             # this is reported to be an issue especially with Chromecast players.
             # see for example: https://github.com/music-assistant/support/issues/3717
-            # one continuous stream, so the player gains nothing from running far ahead
-            extra_input_args=output_pacing_args(PacingProfile.NEAR_REALTIME),
+            # one continuous stream, so the player gains nothing from running far ahead;
+            # the opening burst is the lead its inline track boundaries play out of
+            extra_input_args=output_pacing_args(
+                flow_pacing_profile(start_queue_item.streamdetails)
+            ),
             # without ICY framing, pass on whatever ffmpeg has encoded: an exact 1s read
             # holds back FLAC on quiet passages until the player gives up waiting
             chunk_size=icy_meta_interval if enable_icy else None,

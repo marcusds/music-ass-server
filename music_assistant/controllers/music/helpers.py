@@ -61,6 +61,111 @@ def search_name_match_clause(
     )
 
 
+def search_words_match_clause(
+    db_table: str,
+    words: Sequence[str],
+    param_name: str,
+    query_params: dict[str, Any],
+    related_names: Sequence[tuple[str, str, str, str]] = (),
+) -> str:
+    """
+    Return a SQL WHERE fragment matching every word of a search, in any order.
+
+    Each word must occur in the search_name of the item itself or, when given, in the
+    search_name of one of its related items (e.g. the artists of a track). A search
+    without any word long enough for the trigram index is matched as one phrase instead.
+
+    :param db_table: The media item table to match against.
+    :param words: The (already normalized) words of the search.
+    :param param_name: Prefix of the query parameters the words are bound to.
+    :param query_params: Query parameters dict the words are bound into.
+    :param related_names: Related item names a word may also match, as tuples of
+        (link table, link column to this item, link column to the related item, related table).
+    """
+    if not is_word_search(words):
+        return search_name_match_clause(db_table, "".join(words), param_name, query_params)
+    word_clauses: list[str] = []
+    for idx, word in enumerate(words):
+        word_param = f"{param_name}_{idx}"
+        if len(word) < MIN_FTS_TERM_LENGTH:
+            # short words cannot use the trigram index; they are checked per row on the
+            # (already narrowed) candidates of the longer words instead of scanning a table
+            query_params[word_param] = word
+            alternatives = [f"instr({db_table}.search_name, :{word_param}) > 0"]
+            alternatives.extend(
+                f"EXISTS(SELECT 1 FROM {link_table} sw_link "
+                f"JOIN {related_table} sw_rel ON sw_rel.item_id = sw_link.{related_column} "
+                f"WHERE sw_link.{item_column} = {db_table}.item_id "
+                f"AND instr(sw_rel.search_name, :{word_param}) > 0)"
+                for link_table, item_column, related_column, related_table in related_names
+            )
+        else:
+            # see search_name_match_clause for the quoting
+            query_params[word_param] = f'"{word}"'
+            alternatives = [
+                f"{db_table}.item_id IN "
+                f"(SELECT rowid FROM {db_table}_fts WHERE {db_table}_fts MATCH :{word_param})"
+            ]
+            alternatives.extend(
+                f"{db_table}.item_id IN (SELECT sw_link.{item_column} FROM {link_table} sw_link "
+                f"WHERE sw_link.{related_column} IN (SELECT rowid FROM {related_table}_fts "
+                f"WHERE {related_table}_fts MATCH :{word_param}))"
+                for link_table, item_column, related_column, related_table in related_names
+            )
+        word_clauses.append(f"({' OR '.join(alternatives)})")
+    return f"({' AND '.join(word_clauses)})"
+
+
+def search_relevance_sql(
+    db_table: str, words: Sequence[str], param_name: str, query_params: dict[str, Any]
+) -> str:
+    """
+    Return a SQL ORDER BY expression that ranks the items matching a search on relevance.
+
+    Lower values are more relevant: exact name match, name starting with the search, name
+    containing the search, name containing all its words (in any order), anything else.
+
+    :param db_table: The media item table the search matched.
+    :param words: The (already normalized) words of the search.
+    :param param_name: Prefix of the query parameters the expression binds.
+    :param query_params: Query parameters dict the search is bound into.
+    """
+    phrase_param = f"{param_name}_phrase"
+    query_params[phrase_param] = "".join(words)
+    search_name = f"{db_table}.search_name"
+    tiers = [
+        f"WHEN {search_name} = :{phrase_param} THEN 0",
+        f"WHEN instr({search_name}, :{phrase_param}) = 1 THEN 1",
+        f"WHEN instr({search_name}, :{phrase_param}) > 0 THEN 2",
+    ]
+    if len(words) > 1:
+        word_checks: list[str] = []
+        for idx, word in enumerate(words):
+            word_param = f"{param_name}_word_{idx}"
+            query_params[word_param] = word
+            word_checks.append(f"instr({search_name}, :{word_param}) > 0")
+        tiers.append(f"WHEN {' AND '.join(word_checks)} THEN 3")
+    return f"CASE {' '.join(tiers)} ELSE 4 END"
+
+
+def is_word_search(words: Sequence[str]) -> bool:
+    """
+    Return if a search is matched word by word instead of as one phrase.
+
+    :param words: The (already normalized) words of the search.
+    """
+    return len(words) > 1 and any(len(word) >= MIN_FTS_TERM_LENGTH for word in words)
+
+
+def split_search_words(search: str) -> list[str]:
+    """
+    Return the normalized words of a search query, in their original order.
+
+    :param search: The search query as typed or as already normalized by the listing.
+    """
+    return create_safe_string(search, True, False).split()
+
+
 def sort_search_result[SortItemT: MediaItemType | ItemMapping](
     search_query: str,
     items: Sequence[SortItemT],

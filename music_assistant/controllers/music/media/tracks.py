@@ -49,8 +49,11 @@ from music_assistant.constants import (
 )
 from music_assistant.controllers.music.constants import SIMILAR_ITEMS_LIMIT
 from music_assistant.controllers.music.helpers import (
+    is_word_search,
     provider_mappings_for_update,
     search_name_match_clause,
+    search_words_match_clause,
+    split_search_words,
 )
 from music_assistant.controllers.music.listing import apply_listing, resolve_listing_sort
 from music_assistant.controllers.music.listing_cache import Listing
@@ -356,10 +359,13 @@ class TracksController(MediaControllerBase[Track]):
             )
             artist_join_added = True
 
+        rank_search = self._relevance_search(search, sort_field, order_by)
+        words = split_search_words(search) if search else []
         if search and " - " in search:
             artist_str, title_str = search.split(" - ", 1)
             search = None
             title_str = create_safe_string(title_str, True, True)
+            rank_search = title_str if rank_search else None
             artist_str = create_safe_string(artist_str, True, True)
             extra_query_parts.append(
                 search_name_match_clause("tracks", title_str, "search_title", extra_query_params)
@@ -380,6 +386,18 @@ class TracksController(MediaControllerBase[Track]):
                         "artists", artist_str, "search_artist", extra_query_params
                     )
                 )
+        elif is_word_search(words):
+            # the words of the search may be spread over the track name and its artists
+            extra_query_parts.append(
+                search_words_match_clause(
+                    "tracks",
+                    words,
+                    "search_word",
+                    extra_query_params,
+                    related_names=(("track_artists", "track_id", "artist_id", "artists"),),
+                )
+            )
+            search = None
         result = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
@@ -397,6 +415,7 @@ class TracksController(MediaControllerBase[Track]):
             summary=summary,
             reachable_via=reachable_via,
             random_seed=random_seed,
+            rank_search=rank_search,
         )
         if search and len(result) < 25 and not offset:
             # append artist items to result
@@ -432,6 +451,7 @@ class TracksController(MediaControllerBase[Track]):
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
+                played_only=played_only,
                 in_library_only=True,
                 summary=summary,
                 reachable_via=reachable_via,
@@ -440,6 +460,8 @@ class TracksController(MediaControllerBase[Track]):
                 # prevent duplicates (when artist is also in the title)
                 if _track.uri not in existing_uris:
                     result.append(_track)
+                    if limit and len(result) >= limit:
+                        break
         return result
 
     async def versions(

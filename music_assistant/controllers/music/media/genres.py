@@ -56,7 +56,7 @@ from music_assistant.constants import (
     GENRE_ICONS_DIR_NAME,
     RESOURCES_DIR,
 )
-from music_assistant.controllers.music.helpers import search_name_match_clause
+from music_assistant.controllers.music.helpers import search_words_match_clause
 from music_assistant.controllers.music.listing import resolve_listing_sort
 from music_assistant.controllers.tasks.context import update_current_task_progress_text
 from music_assistant.helpers.database import UNSET
@@ -1381,7 +1381,9 @@ class GenreController(MediaControllerBase[Genre]):
 
     def _search_filter_clause(self, search: str, query_params: dict[str, Any]) -> str:
         """Return search filter that also matches genre aliases."""
-        name_clause = search_name_match_clause(self.db_table, search, "search", query_params)
+        name_clause = search_words_match_clause(
+            self.db_table, search.split(), "search", query_params
+        )
         return (
             f"({name_clause}"
             " OR EXISTS("

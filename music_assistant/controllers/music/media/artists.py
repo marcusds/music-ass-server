@@ -184,7 +184,8 @@ class ArtistsController(MediaControllerBase[Artist]):
         query_parts = []
         query_params: dict[str, Any] = {}
         if artist_type:
-            query_parts.append(f"artist_type = '{artist_type}'")
+            query_parts.append("artist_type = :filter_artist_type")
+            query_params["filter_artist_type"] = str(artist_type)
         if favorite_only:
             query_parts.append(self._favorite_filter_clause(query_params, True))
         if album_artists_only:
@@ -246,7 +247,8 @@ class ArtistsController(MediaControllerBase[Artist]):
         extra_query_params: dict[str, Any] = {}
         extra_query_parts: list[str] = []
         if artist_type:
-            extra_query_parts = [f"artist_type = '{artist_type}'"]
+            extra_query_parts = ["artist_type = :filter_artist_type"]
+            extra_query_params["filter_artist_type"] = str(artist_type)
         if album_artists_only and artist_type in (None, ArtistType.SINGER):
             extra_query_parts.append(self._album_artist_clause(extra_query_params))
         return await self.get_library_items_by_query(
@@ -265,6 +267,7 @@ class ArtistsController(MediaControllerBase[Artist]):
             summary=summary,
             reachable_via=reachable_via,
             random_seed=random_seed,
+            rank_search=self._relevance_search(search, sort_field, order_by),
         )
 
     async def tracks(

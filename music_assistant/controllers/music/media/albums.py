@@ -40,10 +40,13 @@ from music_assistant_models.media_items import (
 from music_assistant.constants import DB_TABLE_ALBUM_ARTISTS, DB_TABLE_ALBUM_TRACKS, DB_TABLE_ALBUMS
 from music_assistant.controllers.music.helpers import (
     fill_track_from_recording,
+    is_word_search,
     metadata_for_update,
     provider_mappings_for_update,
     provider_mappings_from_urls,
     search_name_match_clause,
+    search_words_match_clause,
+    split_search_words,
 )
 from music_assistant.controllers.music.listing import apply_listing, resolve_listing_sort
 from music_assistant.controllers.music.listing_cache import Listing, cached_listing
@@ -259,11 +262,14 @@ class AlbumsController(MediaControllerBase[Album]):
                 "JOIN artists ON artists.item_id = album_artists.artist_id"
             )
             artist_table_joined = True
+        rank_search = self._relevance_search(search, sort_field, order_by)
+        words = split_search_words(search) if search else []
         if search and " - " in search:
             # handle combined artist + title search
             artist_str, title_str = search.split(" - ", 1)
             search = None
             title_str = create_safe_string(title_str, True, True)
+            rank_search = title_str if rank_search else None
             artist_str = create_safe_string(artist_str, True, True)
             extra_query_parts.append(
                 search_name_match_clause("albums", title_str, "search_title", extra_query_params)
@@ -284,6 +290,18 @@ class AlbumsController(MediaControllerBase[Album]):
                         "artists", artist_str, "search_artist", extra_query_params
                     )
                 )
+        elif is_word_search(words):
+            # the words of the search may be spread over the album name and its artists
+            extra_query_parts.append(
+                search_words_match_clause(
+                    "albums",
+                    words,
+                    "search_word",
+                    extra_query_params,
+                    related_names=(("album_artists", "album_id", "artist_id", "artists"),),
+                )
+            )
+            search = None
         result = await self.get_library_items_by_query(
             favorite=favorite,
             search=search,
@@ -301,6 +319,7 @@ class AlbumsController(MediaControllerBase[Album]):
             summary=summary,
             reachable_via=reachable_via,
             random_seed=random_seed,
+            rank_search=rank_search,
         )
 
         # Calculate how many more items we need to reach the original limit
@@ -327,6 +346,7 @@ class AlbumsController(MediaControllerBase[Album]):
             for album in await self.get_library_items_by_query(
                 favorite=favorite,
                 search=None,
+                genre_ids=genre,
                 limit=remaining_limit,
                 sort_field=field,
                 sort_direction=direction,
@@ -336,6 +356,7 @@ class AlbumsController(MediaControllerBase[Album]):
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
                 extra_join_parts=extra_join_parts,
+                played_only=played_only,
                 in_library_only=True,
                 summary=summary,
                 reachable_via=reachable_via,

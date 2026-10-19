@@ -33,10 +33,15 @@ BROWSE_CACHE_EXPIRATION: Final[int] = 2 * 60
 SIMILAR_ITEMS_LIMIT: Final[int] = 25
 
 # max time to wait for a single provider's search results before
-# contributing empty results for it, so one slow provider can never block
-# the whole search; the provider search itself continues in the background
-# so its result is cached and available for a next search request
+# contributing empty results for it (plus the grace below in the global search),
+# so one slow provider can never block the whole search; the provider search
+# itself continues in the background so its result is cached and available
+# for a next search request
 SEARCH_PROVIDER_SOFT_TIMEOUT: Final[int] = 8
+# extra time the global search waits for a provider that missed the soft timeout,
+# so a provider that is only a little slow (e.g. briefly rate limited) is not
+# dropped from the response; providers should still aim for the soft timeout
+SEARCH_PROVIDER_STRAGGLER_GRACE: Final[int] = 7
 # absolute max time a (background) provider search may run,
 # rate limited providers can be very slow to respond
 SEARCH_PROVIDER_HARD_TIMEOUT: Final[int] = 120
@@ -45,6 +50,9 @@ SEARCH_PROVIDER_HARD_TIMEOUT: Final[int] = 120
 # user may add or change content at any time
 SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER: Final[int] = 24 * 3600
 SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER: Final[int] = 900
+# an empty result can be a provider hiccup (e.g. a rate limit that was swallowed),
+# so it is only kept long enough to absorb repeated identical searches
+SEARCH_CACHE_EXPIRATION_EMPTY_RESULT: Final[int] = 60
 # how long to cache combined search results (fast path for repeated searches)
 SEARCH_CACHE_EXPIRATION_COMBINED: Final[int] = 600
 

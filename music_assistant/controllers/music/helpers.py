@@ -134,6 +134,11 @@ def filter_search_results(
     )
 
 
+def search_results_empty(results: SearchResults) -> bool:
+    """Return True if the given search results hold no items at all."""
+    return not any(getattr(results, field.name) for field in fields(results))
+
+
 def metadata_for_update(
     stored: MediaItemMetadata,
     update: MediaItemMetadata,

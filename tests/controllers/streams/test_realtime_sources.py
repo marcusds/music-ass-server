@@ -2358,23 +2358,28 @@ def _flow_handler(
     return controller, request, seen
 
 
-@pytest.mark.parametrize("is_realtime", [False, True], ids=["buffered", "realtime"])
-async def test_flow_is_always_paced_close_to_playback(
-    monkeypatch: pytest.MonkeyPatch, is_realtime: bool
+@pytest.mark.parametrize(
+    ("is_realtime", "profile"),
+    [(False, PacingProfile.BUFFERED_FLOW), (True, PacingProfile.NEAR_REALTIME)],
+    ids=["buffered", "realtime"],
+)
+async def test_flow_is_paced_close_to_playback_with_a_burst_by_its_opening_item(
+    monkeypatch: pytest.MonkeyPatch, is_realtime: bool, profile: PacingProfile
 ) -> None:
     """
-    A flow gets the realtime pace whatever it opens on.
+    A flow gets the realtime pace whatever it opens on, and its burst from its opening item.
 
     It plays out as one continuous stream, so a player running far ahead of it buys
     nothing, and a just-in-time source later in the queue would lose the head start
-    its crossfade needs.
+    its crossfade needs. Only an opening item that fills ahead of playback can give
+    the player a larger lead for the track boundaries the flow resolves inline.
     """
     controller, request, seen = _flow_handler(monkeypatch, is_realtime=is_realtime)
 
     with pytest.raises(_FfmpegArgsCaptured):
         await controller.serve_queue_flow_stream(request)
 
-    assert seen["extra_input_args"] == output_pacing_args(PacingProfile.NEAR_REALTIME)
+    assert seen["extra_input_args"] == output_pacing_args(profile)
 
 
 async def test_flow_producer_learns_when_its_player_left(monkeypatch: pytest.MonkeyPatch) -> None:

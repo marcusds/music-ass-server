@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from music_assistant_models.enums import VolumeNormalizationMode
 
@@ -13,6 +13,9 @@ from music_assistant.constants import (
     DB_TABLE_SETTINGS,
 )
 from music_assistant.helpers.util import get_total_system_memory, meets_memory_target
+
+if TYPE_CHECKING:
+    from music_assistant_models.streamdetails import StreamDetails
 
 # What the volume normalization preference falls back to.
 DEFAULT_VOLUME_NORMALIZATION_MODE: Final = VolumeNormalizationMode.FALLBACK_DYNAMIC
@@ -83,13 +86,20 @@ class PacingProfile(StrEnum):
     # a track handed over on its own. The opening chunk is what a gapless player holds
     # before it starts, and the head start rides out a hiccup later in the track
     DEFAULT = "default"
-    # the flow stream, and sources that hand their audio over just-in-time. Those are
+    # sources that hand their audio over just-in-time, and a flow stream that opens on
+    # one or does not know how long its opening item lasts. Those sources are
     # radio and a Spotify music provider track on its Soloist backend, not Spotify
     # Connect, which is an AUDIO_SOURCE and takes LOW_LATENCY. Such a source delivers
     # ~1.1x at best, and what it banks ahead is all its end-of-track crossfade has.
     # A pace close to playback speed leaves most of that on the server. The burst is
     # the least a player holds at a session start, before a slow source earned it a lead.
     NEAR_REALTIME = "near_realtime"
+    # a flow stream that opens on an item whose source fills ahead of playback. It keeps
+    # the NEAR_REALTIME pace, so a just-in-time source later in the session banks the
+    # same, but opens with a larger burst: one taken from the opening item's own buffer,
+    # which costs no later source its bank. The flow fetches every next item inline at
+    # its boundary, so this lead is what a slow boundary plays out of.
+    BUFFERED_FLOW = "buffered_flow"
     # live AudioSource streams, where whatever the burst hands over sits in the
     # player's buffer as listening delay
     LOW_LATENCY = "low_latency"
@@ -98,8 +108,25 @@ class PacingProfile(StrEnum):
 _PACING: Final[dict[PacingProfile, tuple[str, str]]] = {
     PacingProfile.DEFAULT: ("1.1", "60"),
     PacingProfile.NEAR_REALTIME: ("1.01", "3"),
+    PacingProfile.BUFFERED_FLOW: ("1.01", "10"),
     PacingProfile.LOW_LATENCY: ("1.02", "0.5"),
 }
+
+
+def flow_pacing_profile(streamdetails: StreamDetails | None) -> PacingProfile:
+    """
+    Return the pacing profile for a flow stream that opens on the given item.
+
+    :param streamdetails: Stream details of the item the flow stream opens on.
+    """
+    if streamdetails is None or streamdetails.is_realtime or not streamdetails.duration:
+        return PacingProfile.NEAR_REALTIME
+    burst = float(_PACING[PacingProfile.BUFFERED_FLOW][1])
+    # an item that ends inside the burst would hand the rest of it out of the next item,
+    # which may be a just-in-time source that needs that audio for its crossfade
+    if streamdetails.duration - (streamdetails.seek_position or 0) <= burst:
+        return PacingProfile.NEAR_REALTIME
+    return PacingProfile.BUFFERED_FLOW
 
 
 # A realtime source that allows a single stream (Spotify's soloist backend) delivers audio

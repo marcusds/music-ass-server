@@ -64,6 +64,7 @@ from music_assistant.helpers.compare import (
     compare_artist,
     compare_strings,
     compare_track,
+    dedupe_track_recordings,
 )
 from music_assistant.helpers.database import UNSET
 from music_assistant.helpers.json import serialize_to_json
@@ -1315,8 +1316,7 @@ class ArtistsController(MediaControllerBase[Artist]):
         if provider.supports_feature(ProviderFeature.ARTIST_TRACKS):
             return Listing(await provider.get_artist_tracks(item_id))
         # fallback: enumerate (and dedupe) the tracks of all the artist's albums on the provider
-        result: list[Track] = []
-        unique_ids: set[str] = set()
+        found: list[Track] = []
         provider_error: Exception | None = None
         for album in await self.get_provider_artist_albums(item_id, provider_instance_id_or_domain):
             try:
@@ -1334,12 +1334,8 @@ class ArtistsController(MediaControllerBase[Artist]):
                     err,
                 )
                 continue
-            for track in album_tracks:
-                unique_id = f"{track.name}.{track.version}"
-                if unique_id in unique_ids:
-                    continue
-                unique_ids.add(unique_id)
-                result.append(track)
+            found.extend(album_tracks)
+        result = dedupe_track_recordings(found)
         if provider_error is not None and not any(track.available for track in result):
             # nothing could be played at all, so surface the reason instead of an empty list
             raise provider_error

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from difflib import SequenceMatcher
 from enum import Enum, IntEnum
 from functools import lru_cache
@@ -72,6 +72,14 @@ _FEATURED_ARTIST_SPLITTER = re.compile(
 )
 # Split structured artist lists conservatively; '&' and 'with' often belong to band names.
 _ARTIST_LIST_SPLITTER = re.compile(r"\s*,\s*")
+# wording that marks a release as another artist's rendition of a song
+_COVER_RELEASE_WORDING = re.compile(
+    r"\b(?:karaoke|tribute|backing track|cover version|originally performed by|"
+    r"made famous by|in the style of|as performed by)\b",
+    re.IGNORECASE,
+)
+# the bracketed parts of a name, and the part after a spaced dash
+_NAME_SUFFIX = re.compile(r"[(\[]([^)\]]*)[)\]]|\s[-\u2013\u2014]\s(.*)$")
 
 # retail suffixes a provider (notably Apple Music) appends to an EP/single title.
 # Entries must be a single ASCII alphanumeric word: album_retail_suffix_sql_match matches
@@ -911,6 +919,82 @@ def compare_artists(
     return len(base_items) == len(compare_items) == matches
 
 
+def is_cover_release(name: str, version: str = "") -> bool:
+    """
+    Return True when the version of a track or album, or a suffix of its name, marks it as a cover.
+
+    A karaoke, tribute or "originally performed by" release renders another artist's songs.
+    A live take or remaster of the artist's own recording is not a cover.
+
+    :param name: The name of the track or album.
+    :param version: The version of the track or album.
+    """
+    # only a bracketed or dashed suffix of the name counts, as a song may be called "Tribute"
+    parts = [version, *(match.group(1) or match.group(2) for match in _NAME_SUFFIX.finditer(name))]
+    return any(part and _COVER_RELEASE_WORDING.search(part) for part in parts)
+
+
+def is_artist_own_track(track: Track, artist_items: Sequence[Artist | ItemMapping]) -> bool:
+    """
+    Return True when the track belongs to the artist's own catalog.
+
+    That is the case when the artist is the track's primary (first) artist, or an artist of the
+    album the track is on. A cover release never belongs to it, and a track without artists does.
+
+    :param track: The track to check.
+    :param artist_items: The items of the artist, such as its library and provider items.
+    """
+    if is_cover_release(track.name, track.version):
+        return False
+    if not track.artists:
+        return True
+    # the library does not store the order of a track's artists, so any of them counts there
+    credited = track.artists if track.provider == "library" else track.artists[:1]
+    if _artist_among(credited, artist_items):
+        return True
+    return isinstance(track.album, Album) and _artist_among(track.album.artists, artist_items)
+
+
+def is_artist_own_album(album: Album, artist_items: Sequence[Artist | ItemMapping]) -> bool:
+    """
+    Return True when the album belongs to the artist's own catalog.
+
+    An album by other artists (such as a tribute compilation) or a cover release does not.
+    An album without artists does.
+
+    :param album: The album to check.
+    :param artist_items: The items of the artist, such as its library and provider items.
+    """
+    if is_cover_release(album.name, album.version):
+        return False
+    return not album.artists or _artist_among(album.artists, artist_items)
+
+
+def dedupe_track_recordings(tracks: Iterable[Track]) -> list[Track]:
+    """
+    Return the tracks without the repeats of a recording, keeping the first of each.
+
+    Tracks are one recording when their names and versions match and their durations are close
+    or unknown. Two songs that share a title (such as "Intro") are both kept.
+
+    :param tracks: The tracks to deduplicate, in order of preference.
+    """
+    result: list[Track] = []
+    seen: dict[tuple[str, str], list[Track]] = {}
+    for track in tracks:
+        same_named = seen.setdefault((track.name.casefold(), track.version.casefold()), [])
+        if any(
+            not track.duration
+            or not other.duration
+            or abs(track.duration - other.duration) <= _LOOSE_TRACK_DURATION_TOLERANCE
+            for other in same_named
+        ):
+            continue
+        same_named.append(track)
+        result.append(track)
+    return result
+
+
 def compare_item_ids(
     base_item: MediaItem | ItemMapping, compare_item: MediaItem | ItemMapping
 ) -> bool:
@@ -1477,3 +1561,10 @@ def _finalize_album_evidence(
     if not ambiguous:
         return AlbumMatchEvidence.MATCH
     return fingerprint_evidence
+
+
+def _artist_among(
+    credited: Sequence[Artist | ItemMapping], artist_items: Sequence[Artist | ItemMapping]
+) -> bool:
+    """Return True when one of the credited artists is one of the given artist items."""
+    return any(compare_artist(item, artist) for artist in credited for item in artist_items)

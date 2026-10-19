@@ -73,7 +73,13 @@ from music_assistant.helpers.collections import (
     get_collection_item_id,
     get_collection_item_media_type_from_item_id,
 )
-from music_assistant.helpers.compare import compare_album
+from music_assistant.helpers.compare import (
+    compare_album,
+    dedupe_track_recordings,
+    is_artist_own_album,
+    is_artist_own_track,
+    is_cover_release,
+)
 from music_assistant.helpers.provider_access import playback_instance_for, playback_sources_for
 from music_assistant.helpers.util import is_disc_dir
 from music_assistant.models.music_provider import (
@@ -815,10 +821,16 @@ class MediaResolver:
             }
             if (provider_albums := await self._provider_artist_albums(artist)) is None:
                 return albums or None
+            artist_items = [item for item in (artist, library_artist) if item is not None]
             for album in provider_albums:
-                if album.album_type in PROVIDER_ALBUM_SKIPPED_TYPES or any(
-                    (mapping.provider_instance, mapping.item_id) in in_library
-                    for mapping in album.provider_mappings
+                if (
+                    album.album_type in PROVIDER_ALBUM_SKIPPED_TYPES
+                    or any(
+                        (mapping.provider_instance, mapping.item_id) in in_library
+                        for mapping in album.provider_mappings
+                    )
+                    # a tribute or another artist's album the artist only appears on
+                    or not is_artist_own_album(album, artist_items)
                 ):
                     continue
                 # an album plays once, even when the library or another provider has it unlinked;
@@ -885,8 +897,7 @@ class MediaResolver:
                 )
             random.shuffle(tracks)
             return tracks
-        result: list[Track] = []
-        seen: set[str] = set()
+        found: list[Track] = []
         sources = await asyncio.gather(
             self._library_artist_tracks(artist),
             self._provider_artist_tracks(artist),
@@ -898,12 +909,18 @@ class MediaResolver:
                     "Error resolving some tracks for artist %s", artist.name, exc_info=source
                 )
                 continue
-            for track in source:
-                unique_id = f"{track.name}.{track.version}"
-                if unique_id in seen:
-                    continue
-                seen.add(unique_id)
-                result.append(track)
+            found.extend(source)
+        # the artist's own catalog: no covers, and no songs of others it only features on
+        library_artist = await self._resolve_library_artist(artist)
+        artist_items = [item for item in (artist, library_artist) if item is not None]
+        own = [track for track in found if is_artist_own_track(track, artist_items)]
+        if not own:
+            # an artist that only features on the songs of others still plays those
+            own = [track for track in found if not is_cover_release(track.name, track.version)]
+        self.logger.debug(
+            "Playing %s of the %s tracks found for artist %s", len(own), len(found), artist.name
+        )
+        result = dedupe_track_recordings(own)
         random.shuffle(result)
         return result
 

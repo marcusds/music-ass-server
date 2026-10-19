@@ -825,7 +825,7 @@
   "core.player_queues.config_entries.default_enqueue_select_album.options.all_tracks": "All tracks for album on (streaming) provider",
   "core.player_queues.config_entries.default_enqueue_select_album.options.library_tracks": "Only in-library tracks",
   "core.player_queues.config_entries.default_enqueue_select_artist.label": "Items to select when you play a (in-library) artist.",
-  "core.player_queues.config_entries.default_enqueue_select_artist.options.all_tracks": "All tracks from all providers",
+  "core.player_queues.config_entries.default_enqueue_select_artist.options.all_tracks": "All of the artist's own tracks from all providers, without covers",
   "core.player_queues.config_entries.default_enqueue_select_artist.options.library_tracks": "In-library tracks for the artist only",
   "core.player_queues.config_entries.default_enqueue_select_artist.options.prefer_library": "Prefer library, fall back to top",
   "core.player_queues.config_entries.default_enqueue_select_artist.options.top_tracks": "Artist top tracks only",

@@ -420,7 +420,10 @@ mechanism) that configure default enqueue behaviour, in three groups:
   in random or release order. The artist selection picks the artist's own albums, and each album
   plays as it does on its own, following the album selection. The album orders leave out singles,
   and the compilations found only on a provider. They fall back to shuffled tracks for the top
-  tracks selection or an artist without albums.
+  tracks selection or an artist without albums. All tracks plays the artist's own catalog: a track
+  plays when the artist is its first artist or an album artist, and karaoke, tribute and other
+  cover releases are left out, as are the provider albums of other artists. An artist with no
+  track of its own plays the songs it features on.
 - **Click actions** — what a client does when an artist, album, track, genre, radio, or playlist is
   clicked (*browse* or *play*), and what the play button on a track row inside an album
   or playlist starts (*play from here* or *play track*).

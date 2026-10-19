@@ -25,6 +25,8 @@ from music_assistant_models.media_items import (
 
 from music_assistant.controllers.music import MusicController
 from music_assistant.controllers.music.constants import (
+    SEARCH_CACHE_EXPIRATION_COMBINED,
+    SEARCH_CACHE_EXPIRATION_EMPTY_RESULT,
     SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER,
     SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER,
 )
@@ -337,9 +339,12 @@ async def test_global_search_returns_partial_results_when_provider_fails() -> No
 async def test_global_search_soft_timeout_returns_partial_and_caches_late(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A slow provider is not awaited beyond the soft timeout but still caches its result."""
+    """A slow provider is not awaited beyond soft timeout and grace but still caches its result."""
     monkeypatch.setattr(
-        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_SOFT_TIMEOUT", 0.1
+        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_SOFT_TIMEOUT", 0.05
+    )
+    monkeypatch.setattr(
+        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_STRAGGLER_GRACE", 0.05
     )
     prov_fast = _make_search_provider("prov_fast")
     prov_fast.search.return_value = SearchResults(
@@ -359,7 +364,7 @@ async def test_global_search_soft_timeout_returns_partial_and_caches_late(
     result = await controller.search("My Song", media_types=[MediaType.TRACK], limit=5)
     duration = time.monotonic() - start
 
-    # the search returned within the soft timeout with the results of the fast provider
+    # the search returned within soft timeout and grace with the results of the fast provider
     assert duration < 0.4
     assert [track.item_id for track in result.tracks] == ["track1"]
     assert not _cache_writes(controller, "music")
@@ -406,6 +411,9 @@ async def test_global_search_hard_timeout_aborts_provider_search(
         "music_assistant.controllers.music.controller.SEARCH_PROVIDER_SOFT_TIMEOUT", 0.05
     )
     monkeypatch.setattr(
+        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_STRAGGLER_GRACE", 0
+    )
+    monkeypatch.setattr(
         "music_assistant.controllers.music.controller.SEARCH_PROVIDER_HARD_TIMEOUT", 0.1
     )
     prov_hung = _make_search_provider("prov_hung")
@@ -428,6 +436,80 @@ async def test_global_search_hard_timeout_aborts_provider_search(
     await _wait_for(search_aborted.is_set)
     cache_set = cast("AsyncMock", controller.mass.cache.set)
     assert not cache_set.await_args_list
+
+
+async def test_global_search_waits_grace_for_slow_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider that misses the soft timeout but answers within the grace is included."""
+    monkeypatch.setattr(
+        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_SOFT_TIMEOUT", 0.05
+    )
+    monkeypatch.setattr(
+        "music_assistant.controllers.music.controller.SEARCH_PROVIDER_STRAGGLER_GRACE", 1
+    )
+    prov_fast = _make_search_provider("prov_fast")
+    prov_fast.search.return_value = SearchResults(
+        tracks=[_make_track("track1", "prov_fast", "My Song")]
+    )
+    prov_slow = _make_search_provider("prov_slow")
+
+    async def _slow_search(*_args: Any, **_kwargs: Any) -> SearchResults:
+        await asyncio.sleep(0.2)
+        return SearchResults(tracks=[_make_track("track2", "prov_slow", "My Song")])
+
+    prov_slow.search.side_effect = _slow_search
+    controller = _make_controller([prov_fast, prov_slow])
+
+    start = time.monotonic()
+    result = await controller.search("My Song", media_types=[MediaType.TRACK], limit=5)
+    duration = time.monotonic() - start
+
+    # the search waited for the straggler, but not for the whole grace
+    assert duration < 0.8
+    assert sorted(track.item_id for track in result.tracks) == ["track1", "track2"]
+    # every provider answered, so the combined result is cached as usual
+    combined_writes = _cache_writes(controller, "music")
+    assert len(combined_writes) == 1
+    assert combined_writes[0].kwargs["expiration"] == SEARCH_CACHE_EXPIRATION_COMBINED
+
+
+async def test_empty_provider_result_gets_short_cache_expiration() -> None:
+    """An empty provider result is not cached for the long streaming expiration."""
+    prov_empty = _make_search_provider("prov_empty")
+    prov_full = _make_search_provider("prov_full")
+    prov_full.search.return_value = SearchResults(
+        tracks=[_make_track("track1", "prov_full", "My Song")]
+    )
+    controller = _make_controller([prov_empty, prov_full])
+
+    result = await controller.search("My Song", media_types=[MediaType.TRACK], limit=5)
+
+    assert [track.item_id for track in result.tracks] == ["track1"]
+    empty_writes = _cache_writes(controller, "prov_empty")
+    full_writes = _cache_writes(controller, "prov_full")
+    assert empty_writes[0].kwargs["expiration"] == SEARCH_CACHE_EXPIRATION_EMPTY_RESULT
+    assert full_writes[0].kwargs["expiration"] == SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER
+    # the combined result holds the empty contribution, so it also expires soon
+    combined_writes = _cache_writes(controller, "music")
+    assert combined_writes[0].kwargs["expiration"] == SEARCH_CACHE_EXPIRATION_EMPTY_RESULT
+
+
+async def test_provider_without_search_keeps_combined_cache_expiration() -> None:
+    """A provider without search support does not shorten the combined cache expiration."""
+    prov_full = _make_search_provider("prov_full")
+    prov_full.search.return_value = SearchResults(
+        tracks=[_make_track("track1", "prov_full", "My Song")]
+    )
+    prov_nosearch = _make_search_provider("prov_nosearch")
+    prov_nosearch.supported_features = set()
+    controller = _make_controller([prov_full, prov_nosearch])
+
+    await controller.search("My Song", media_types=[MediaType.TRACK], limit=5)
+
+    prov_nosearch.search.assert_not_awaited()
+    combined_writes = _cache_writes(controller, "music")
+    assert combined_writes[0].kwargs["expiration"] == SEARCH_CACHE_EXPIRATION_COMBINED
 
 
 async def test_search_provider_cache_hit_avoids_provider_call() -> None:
@@ -466,6 +548,10 @@ async def test_search_provider_cache_expiration_by_provider_type() -> None:
     prov_stream = _make_search_provider("prov_stream")
     prov_local = _make_search_provider("prov_local")
     prov_local.is_streaming_provider = False
+    for prov in (prov_stream, prov_local):
+        prov.search.return_value = SearchResults(
+            tracks=[_make_track("track1", prov.instance_id, "My Song")]
+        )
     controller = _make_controller([prov_stream, prov_local])
 
     await controller.search("My Song", media_types=[MediaType.TRACK], limit=5)

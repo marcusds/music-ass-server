@@ -87,10 +87,12 @@ from music_assistant.controllers.music.constants import (
     MUSIC_SYNC_COMPLETION_CHECK_TASK_ID,
     PROVIDER_MAPPING_CORRECTION_TASK_ID,
     SEARCH_CACHE_EXPIRATION_COMBINED,
+    SEARCH_CACHE_EXPIRATION_EMPTY_RESULT,
     SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER,
     SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER,
     SEARCH_PROVIDER_HARD_TIMEOUT,
     SEARCH_PROVIDER_SOFT_TIMEOUT,
+    SEARCH_PROVIDER_STRAGGLER_GRACE,
     TRACK_RECONCILIATION_BATCH_SIZE,
     TRACK_RECONCILIATION_MAX_DURATION_DELTA,
     TRACK_RECONCILIATION_MAX_TITLE_ROWS,
@@ -103,6 +105,7 @@ from music_assistant.controllers.music.database import (
 from music_assistant.controllers.music.favorites import FavoritesStore
 from music_assistant.controllers.music.helpers import (
     filter_search_results,
+    search_results_empty,
     sibling_instance_mappings,
     sort_search_result,
 )
@@ -684,6 +687,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             library_results = await self.search_library(search_query, media_types, limit=limit)
             results_per_provider.append(library_results)
         all_results_complete = True
+        any_provider_empty = False
         if search_providers:
             # create a set of all provider item ids already in library
             # this way we can avoid returning duplicates in the search results
@@ -712,6 +716,9 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             for provider_instance in search_providers:
                 if not (prov := self.mass.get_provider(provider_instance)):
                     continue
+                if ProviderFeature.SEARCH not in prov.supported_features:
+                    # nothing to search, and its empty result must not shorten the cache
+                    continue
                 # skip media types for which the library already holds a (near)
                 # exact match that is mapped to this provider: searching the
                 # provider again for that media type will not add anything new
@@ -731,6 +738,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                         limit=limit,
                         skip_item_ids=all_prov_item_ids,
                         soft_timeout=SEARCH_PROVIDER_SOFT_TIMEOUT,
+                        straggler_grace=SEARCH_PROVIDER_STRAGGLER_GRACE,
                     )
                 )
             # include results from all (unique) music providers
@@ -740,6 +748,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             for res in gather_results:
                 if isinstance(res, SearchResults):
                     results_per_provider.append(res)
+                    any_provider_empty = any_provider_empty or search_results_empty(res)
                     continue
                 # a provider that failed or timed out contributes no results
                 all_results_complete = False
@@ -820,10 +829,16 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         ):
             setattr(result, field, sort_search_result(search_query, getattr(result, field)))
         # only cache the combined result if all providers contributed,
-        # so a failed or timed out provider is retried on a next search
+        # so a failed or timed out provider is retried on a next search;
+        # a provider that returned nothing gets a short expiration, like its own result
         if all_results_complete:
             await self._cache_search_results(
-                cache_key, result, SEARCH_CACHE_EXPIRATION_COMBINED, self.domain
+                cache_key,
+                result,
+                SEARCH_CACHE_EXPIRATION_EMPTY_RESULT
+                if any_provider_empty
+                else SEARCH_CACHE_EXPIRATION_COMBINED,
+                self.domain,
             )
         return result
 
@@ -3124,6 +3139,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         skip_item_ids: set[tuple[MediaType, str, str]] | None = None,
         strict_provider_instance: bool = False,
         soft_timeout: float | None = None,
+        straggler_grace: float = 0,
     ) -> SearchResults | None:
         """
         Perform search on given provider, returns None if the search failed or timed out.
@@ -3138,6 +3154,8 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         :param strict_provider_instance: Do not fall back to another provider instance.
         :param soft_timeout: Seconds to wait before returning None while the search
                              continues in the background; None waits for it to finish.
+        :param straggler_grace: Extra seconds to wait for the search after the soft timeout
+                                passed, before giving up on it.
         """
         prov = self.mass.get_provider(
             provider_instance_id_or_domain,
@@ -3174,14 +3192,16 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             self._execute_provider_search(prov, search_query, media_types, limit, cache_key),
             task_id=f"provider_search_{prov.instance_id}_{cache_key}",
         )
+        max_wait = None if soft_timeout is None else soft_timeout + straggler_grace
         try:
-            async with asyncio.timeout(soft_timeout):
+            async with asyncio.timeout(max_wait):
                 prov_search_results = await asyncio.shield(task)
         except TimeoutError:
             self.logger.warning(
-                "Search on provider %s did not return in time, "
-                "the search continues in the background",
+                "Search on provider %s did not return within %s seconds and is left out "
+                "of the results, the search continues in the background",
                 prov.name,
+                max_wait,
             )
             return None
         if prov_search_results is None:
@@ -3217,16 +3237,16 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             return None
         # only successful results are cached, so failed or timed out
         # provider searches are simply retried on a next search
-        await self._cache_search_results(
-            cache_key,
-            result,
+        if search_results_empty(result):
+            # an empty result may be a hiccup of the provider, do not keep it for long
+            expiration = SEARCH_CACHE_EXPIRATION_EMPTY_RESULT
+        elif getattr(prov, "is_streaming_provider", False):
+            expiration = SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER
+        else:
             # plugin providers do not declare is_streaming_provider,
             # treat them as local so their results only get the short expiration
-            SEARCH_CACHE_EXPIRATION_STREAMING_PROVIDER
-            if getattr(prov, "is_streaming_provider", False)
-            else SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER,
-            prov.instance_id,
-        )
+            expiration = SEARCH_CACHE_EXPIRATION_LOCAL_PROVIDER
+        await self._cache_search_results(cache_key, result, expiration, prov.instance_id)
         return result
 
     async def _cache_search_results(

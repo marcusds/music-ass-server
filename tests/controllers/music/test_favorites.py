@@ -108,8 +108,10 @@ async def test_favorites_are_personal(favorites_mass: MusicAssistant) -> None:
         assert await mass.music.tracks.library_count(favorite_only=True) == 0
         assert (await mass.music.tracks.get_library_item(liked.item_id)).favorite is None
         # the summary listing carries the same state as the full item
+        # (the words of the search also match "Personal Disliked", ranked after it)
         summary = await mass.music.tracks.library_items(search="Personal Liked", summary=True)
-        assert [x.favorite for x in summary] == [None]
+        assert summary[0].item_id == liked.item_id
+        assert summary[0].favorite is None
 
 
 async def test_favorites_follow_the_impersonated_user(favorites_mass: MusicAssistant) -> None:

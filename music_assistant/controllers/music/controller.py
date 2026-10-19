@@ -73,9 +73,12 @@ from music_assistant.constants import (
     DB_TABLE_TRACKS,
     PROVIDERS_WITH_SHAREABLE_URLS,
 )
+from music_assistant.controllers.music.ai_lookup import query_ai_lookup_terms
 from music_assistant.controllers.music.constants import (
     BROWSE_CACHE_EXPIRATION,
     CACHE_CATEGORY_SEARCH_RESULTS,
+    CONF_AI_ITEM_LOOKUP,
+    CONF_AI_ITEM_LOOKUP_ENGINE,
     CONF_DELETED_PROVIDERS,
     CONF_KEEP_REMASTERS_APART,
     CONF_RESET_DB,
@@ -155,6 +158,10 @@ from music_assistant.helpers.datetime import (
     utc_timestamp,
 )
 from music_assistant.helpers.json import json_loads, serialize_to_json
+from music_assistant.helpers.plugin_engines import (
+    create_ai_engine_config_entries,
+    select_core_ai_engine,
+)
 from music_assistant.helpers.provider_access import (
     access_allows,
     exact_provider,
@@ -184,11 +191,23 @@ if TYPE_CHECKING:
     from music_assistant_models.media_items import Audiobook, AudioSource
 
     from music_assistant import MusicAssistant
+    from music_assistant.controllers.music.ai_lookup import AILookupTerms
     from music_assistant.controllers.music.media.base import MediaControllerBase
     from music_assistant.helpers.json import SerializableType
     from music_assistant.models import ProviderInstanceType
     from music_assistant.models.provider import Provider
     from music_assistant.providers.builtin import BuiltinProvider
+
+# the media types music/item_by_name can find
+ITEM_BY_NAME_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
+    MediaType.PLAYLIST,
+    MediaType.RADIO,
+    MediaType.TRACK,
+    MediaType.ALBUM,
+    MediaType.ARTIST,
+    MediaType.AUDIOBOOK,
+    MediaType.PODCAST,
+)
 
 
 class RecentPlayedTrack(NamedTuple):
@@ -432,6 +451,19 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 default_value=False,
                 advanced=True,
                 immediate_apply=True,
+            ),
+            ConfigEntry(
+                key=CONF_AI_ITEM_LOOKUP,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
+                required=False,
+                category="generic",
+            ),
+            *await create_ai_engine_config_entries(
+                self.mass,
+                CONF_AI_ITEM_LOOKUP_ENGINE,
+                depends_on=CONF_AI_ITEM_LOOKUP,
+                category="generic",
             ),
             ConfigEntry(
                 key=CONF_RESET_DB,
@@ -3979,30 +4011,56 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         media_type: MediaType | None = None,
     ) -> MediaItemType | ItemMapping | None:
         """Try to find a media item (such as a playlist) by name."""
-        # Future todo: enhance this method with AI capabilities to allow typos and
-        # natural language.
-        searchname = name.lower()
-        allowed_media_types = [
-            MediaType.PLAYLIST,
-            MediaType.RADIO,
-            MediaType.TRACK,
-            MediaType.ALBUM,
-            MediaType.ARTIST,
-            MediaType.AUDIOBOOK,
-            MediaType.PODCAST,
-        ]
-        if media_type in (None, MediaType.UNKNOWN):
-            media_types = allowed_media_types
-        elif media_type not in allowed_media_types:
+        if media_type == MediaType.UNKNOWN:
+            media_type = None
+        if media_type is not None and media_type not in ITEM_BY_NAME_MEDIA_TYPES:
             raise InvalidDataError(
                 f"{media_type} is not a supported media_type. "
-                f"Supported media_types are {allowed_media_types}"
+                f"Supported media_types are {list(ITEM_BY_NAME_MEDIA_TYPES)}"
             )
-        else:
-            media_types = [media_type]
-        library_functions = [
-            self.get_controller(media_type).library_items for media_type in media_types
-        ]
+        item, confident = await self._lookup_item_by_name(name, artist, album, media_type)
+        if confident:
+            return item
+        # a typo or a natural language request finds nothing or an unrelated item, so an
+        # AI engine (when there is one) may correct and structure the request for one more try
+        terms = await self._get_ai_lookup_terms(name, artist, album, media_type)
+        if terms is None:
+            return item
+        ai_media_type = terms.media_type or media_type
+        if (
+            terms.name.lower() == name.lower()
+            and (terms.artist or "").lower() == (artist or "").lower()
+            and (terms.album or "").lower() == (album or "").lower()
+            and ai_media_type == media_type
+        ):
+            return item
+        self.logger.debug("Retrying item lookup for '%s' with AI search terms %s", name, terms)
+        ai_item, ai_confident = await self._lookup_item_by_name(
+            terms.name, terms.artist, terms.album, ai_media_type
+        )
+        if ai_confident or item is None:
+            return ai_item
+        return item
+
+    async def _lookup_item_by_name(
+        self,
+        name: str,
+        artist: str | None,
+        album: str | None,
+        media_type: MediaType | None,
+    ) -> tuple[MediaItemType | ItemMapping | None, bool]:
+        """
+        Find a media item by name in the library, or else with a global search.
+
+        :param name: The name of the item.
+        :param artist: Optional artist name the item should belong to.
+        :param album: Optional album name the item should belong to.
+        :param media_type: The media type of the item, or None for any supported type.
+        :return: The item (if any) and whether its name matches the requested one.
+        """
+        searchname = name.lower()
+        media_types = (media_type,) if media_type else ITEM_BY_NAME_MEDIA_TYPES
+        library_functions = [self.get_controller(x).library_items for x in media_types]
         # prefer (exact) lookup in the library by name
         for func in library_functions:
             result = await func(search=searchname)
@@ -4022,7 +4080,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
                 ):
                     continue
                 if searchname == item.name.lower():
-                    return item
+                    return item, True
         # nothing found in the library, fallback to global search
         search_name = name
         if album and artist:
@@ -4033,9 +4091,7 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
             search_name = f"{artist} - {name}"
         search_results = await self.search(
             search_query=search_name,
-            media_types=[media_type]
-            if media_type and media_type != MediaType.UNKNOWN
-            else MediaType.ALL,
+            media_types=[media_type] if media_type else MediaType.ALL,
             limit=8,
         )
         for results in (
@@ -4049,8 +4105,53 @@ class MusicController(MusicDatabaseSetupMixin, CoreController):
         ):
             for _item in results:
                 # simply return the first item because search is already sorted by best match
-                return _item
-        return None
+                return _item, self._item_matches_name(_item, name, artist)
+        return None, False
+
+    def _item_matches_name(
+        self, item: MediaItemType | ItemMapping, name: str, artist: str | None
+    ) -> bool:
+        """Return whether a search result matches a requested name (and artist) closely."""
+        if not compare_strings(name, item.name, strict=False):
+            return False
+        if not artist or not (artists := getattr(item, "artists", None)):
+            return True
+        return any(compare_strings(artist, x.name, strict=False) for x in artists)
+
+    async def _get_ai_lookup_terms(
+        self,
+        name: str,
+        artist: str | None,
+        album: str | None,
+        media_type: MediaType | None,
+    ) -> AILookupTerms | None:
+        """
+        Ask the configured AI engine for corrected search terms for an item lookup.
+
+        :param name: The requested name.
+        :param artist: The optional requested artist.
+        :param album: The optional requested album.
+        :param media_type: The requested media type, or None for any supported type.
+        :return: The search terms, or None when the lookup is disabled, no engine is
+            available, or the engine gave no usable answer.
+        """
+        if not self.mass.config.get_raw_core_config_value(self.domain, CONF_AI_ITEM_LOOKUP, True):
+            return None
+        try:
+            engine = await select_core_ai_engine(self.mass, self.domain, CONF_AI_ITEM_LOOKUP_ENGINE)
+        except Exception as err:
+            self.logger.debug("Could not select an AI engine for item lookup: %s", err)
+            return None
+        if engine is None:
+            return None
+        return await query_ai_lookup_terms(
+            engine,
+            name,
+            artist,
+            album,
+            (media_type,) if media_type else ITEM_BY_NAME_MEDIA_TYPES,
+            self.logger,
+        )
 
     async def _handle_verify_item_uri(self, uri: str) -> bool:
         user = get_current_user()

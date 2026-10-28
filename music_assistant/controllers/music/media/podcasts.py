@@ -151,6 +151,7 @@ class PodcastsController(MediaControllerBase[Podcast]):
             summary=summary,
             reachable_via=reachable_via,
             random_seed=random_seed,
+            rank_search=self._relevance_search(search, sort_field, order_by),
         )
         if search and len(result) < 25 and not offset:
             # append publisher items to result
@@ -160,7 +161,7 @@ class PodcastsController(MediaControllerBase[Podcast]):
             extra_query_params: dict[str, Any] = {
                 "search": f"%{search}%",
             }
-            return result + await self.get_library_items_by_query(
+            extra_items = await self.get_library_items_by_query(
                 favorite=favorite,
                 search=None,
                 genre_ids=genre,
@@ -172,11 +173,17 @@ class PodcastsController(MediaControllerBase[Podcast]):
                 ),
                 extra_query_parts=extra_query_parts,
                 extra_query_params=extra_query_params,
+                played_only=played_only,
                 in_library_only=True,
                 summary=summary,
                 reachable_via=reachable_via,
                 random_seed=random_seed,
             )
+            # prevent duplicates (when the name also matched) and keep the requested limit
+            existing_uris = {item.uri for item in result}
+            result = [*result, *(x for x in extra_items if x.uri not in existing_uris)]
+            if limit:
+                result = result[:limit]
         return result
 
     async def episodes(

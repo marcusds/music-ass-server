@@ -75,8 +75,10 @@ from music_assistant.controllers.music.constants import (
 from music_assistant.controllers.music.helpers import (
     preferred_thumb,
     provider_mappings_from_urls,
-    search_name_match_clause,
+    search_relevance_sql,
+    search_words_match_clause,
     sibling_instance_mappings,
+    split_search_words,
 )
 from music_assistant.controllers.music.listing import (
     apply_listing,
@@ -652,6 +654,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             collapse_collections=collapse_collections,
             reachable_via=reachable_via,
             random_seed=random_seed,
+            rank_search=self._relevance_search(search, sort_field, order_by),
         )
         if (
             kwargs.get("_localized_fallback", True)
@@ -1910,6 +1913,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             collapse_collections: Literal[True],
             reachable_via: list[str] | None = None,
             random_seed: int | None = None,
+            rank_search: str | None = None,
         ) -> list[ItemCls | MediaCollection[ItemCls]]: ...
 
         @overload
@@ -1933,6 +1937,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             collapse_collections: Literal[False] = False,
             reachable_via: list[str] | None = None,
             random_seed: int | None = None,
+            rank_search: str | None = None,
         ) -> list[ItemCls]: ...
 
         @overload
@@ -1956,6 +1961,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             collapse_collections: bool,
             reachable_via: list[str] | None = None,
             random_seed: int | None = None,
+            rank_search: str | None = None,
         ) -> list[ItemCls] | list[ItemCls | MediaCollection[ItemCls]]: ...
 
     @final
@@ -1979,6 +1985,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         collapse_collections: bool = False,
         reachable_via: list[str] | None = None,
         random_seed: int | None = None,
+        rank_search: str | None = None,
     ) -> list[ItemCls] | list[ItemCls | MediaCollection[ItemCls]]:
         """
         Fetch MediaItem records from database by building the query.
@@ -2005,6 +2012,9 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             instead of individually.
         :param reachable_via: Restrict results to items with a provider mapping reachable
             through one of these provider instance ids, see ``library_items``.
+        :param rank_search: Order the results on their relevance to this search query first,
+            with the sort field only breaking ties. Ignored for collapsed collections and
+            random sorting.
         """
         query_params = dict(extra_query_params) if extra_query_params else {}
         query_parts: list[str] = list(extra_query_parts) if extra_query_parts else []
@@ -2042,6 +2052,14 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
                 in_library_only=in_library_only,
                 reachable_via=reachable_via,
             )
+        rank_sql: str | None = None
+        if (
+            rank_search
+            and not collapse_collections
+            and sort_field not in RANDOM_SORT_FIELDS
+            and (rank_words := split_search_words(rank_search))
+        ):
+            rank_sql = search_relevance_sql(self.db_table, rank_words, "rank", query_params)
         # build and execute final query
         sql_query, base_query_params = self._build_final_query(
             query_parts,
@@ -2050,6 +2068,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
             sort_direction,
             summary=summary,
             random_seed=random_seed,
+            rank_sql=rank_sql,
         )
         # base query params act as defaults: callers may override them via extra_query_params
         for key, value in base_query_params.items():
@@ -2057,7 +2076,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
         if collapse_collections:
             if search:
-                query_params["search"] = f"%{search}%"
+                query_params["search"] = f"%{search.replace(' ', '')}%"
             sql_query = await self._adapt_query_for_collections(
                 sql_query,
                 query_params,
@@ -2479,12 +2498,28 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
 
     def _search_filter_clause(self, search: str, query_params: dict[str, Any]) -> str:
         """Return the SQL WHERE clause fragment used for search filtering."""
-        return search_name_match_clause(self.db_table, search, "search", query_params)
+        return search_words_match_clause(self.db_table, search.split(), "search", query_params)
+
+    @final
+    @staticmethod
+    def _relevance_search(
+        search: str | None, sort_field: SortField | None, order_by: str | None
+    ) -> str | None:
+        """
+        Return the search to rank a library listing on, None to keep the listing sort.
+
+        A search is ranked on relevance unless the caller asked for a sort of its own.
+
+        :param search: The search query of the listing.
+        :param sort_field: The sort field the caller requested.
+        :param order_by: The deprecated sort key the caller requested.
+        """
+        return search if search and sort_field is None and not order_by else None
 
     @final
     def _preprocess_search(self, search: str | None) -> str | None:
-        """Normalize the search string for use in the search filter clauses."""
-        return create_safe_string(search, True, True) if search else search
+        """Normalize the search string to its words, separated by a single space."""
+        return " ".join(split_search_words(search)) if search else search
 
     @final
     @staticmethod
@@ -2710,6 +2745,7 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         *,
         summary: bool = False,
         random_seed: int | None = None,
+        rank_sql: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """Build the final SQL query string and its (base) bound query params."""
         sql_query, base_query_params = self.summary_query if summary else self.base_query
@@ -2731,13 +2767,18 @@ class MediaControllerBase[ItemCls: "MediaItemType"](metaclass=ABCMeta):
         if join_parts:
             sql_query += f" GROUP BY {self.db_table}.item_id"
 
+        order_parts: list[str] = [rank_sql] if rank_sql else []
         if sort_field:
-            sort_sql = (
+            order_parts.append(
                 self._seeded_random_sort_sql(sort_field, random_seed, base_query_params)
                 if sort_field in RANDOM_SORT_FIELDS and random_seed is not None
                 else self._get_sort_sql(sort_field, sort_direction)
             )
-            sql_query += f" ORDER BY {sort_sql}"
+        if rank_sql:
+            # the item id keeps the order of equally ranked items stable across pages
+            order_parts.append(f"{self.db_table}.item_id")
+        if order_parts:
+            sql_query += f" ORDER BY {', '.join(order_parts)}"
 
         return sql_query, base_query_params
 

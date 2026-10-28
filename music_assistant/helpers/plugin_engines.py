@@ -119,6 +119,27 @@ async def select_tts_engine(
     )
 
 
+async def select_core_ai_engine(mass: MusicAssistant, domain: str, key: str) -> AIEngine | None:
+    """
+    Return a core controller's AI engine, adopting the first available one when it has none yet.
+
+    A selection that was made explicitly is honoured or, when that engine no longer exists,
+    reported as missing - another engine is never substituted for it.
+
+    :param mass: The Music Assistant instance to query.
+    :param domain: The domain of the core controller whose selection to read and, if unset, persist.
+    :param key: The config key holding the selected engine uid.
+    """
+    config = mass.config
+    return _select_engine(
+        await get_ai_engines(mass),
+        config.get_raw_core_config_value(domain, key),
+        lambda uid: config.set_raw_core_config_value(domain, key, uid),
+        domain,
+        key,
+    )
+
+
 async def select_core_tts_engine(mass: MusicAssistant, domain: str, key: str) -> TTSEngine | None:
     """
     Return a core controller's TTS engine, adopting the first available one when it has none yet.

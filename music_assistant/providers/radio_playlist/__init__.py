@@ -12,7 +12,7 @@ seed.
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from urllib.parse import unquote
 
 from music_assistant_models.enums import MediaType
@@ -36,12 +36,13 @@ from music_assistant.controllers.music.constants import (
     DYNAMIC_RADIO_DYNAMIC_TARGET,
     RADIO_TRACK_MAX_DURATION_SECS,
 )
+from music_assistant.helpers.compare import is_artist_own_track
 from music_assistant.helpers.track_filter import get_track_filter
 from music_assistant.models.plugin import PluginProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
-    from music_assistant_models.media_items import MediaItemType
+    from music_assistant_models.media_items import Artist, MediaItemType
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -144,6 +145,12 @@ class RadioPlaylistProvider(PluginProvider):
                     seed_tracks = await self.mass.music.artists.tracks(
                         seed.item_id, seed.provider, limit=None
                     )
+                # the artist's own songs, not covers or the songs of others it features on
+                seed_tracks = [
+                    track
+                    for track in seed_tracks
+                    if is_artist_own_track(track, [cast("Artist", seed)])
+                ] or seed_tracks
             else:
                 seed_tracks = await self.mass.player_queues.get_tracks_for_playback(seed)
             for track in seed_tracks:

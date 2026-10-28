@@ -145,7 +145,7 @@
         "top_tracks": "Artist top tracks only",
         "library_tracks": "In-library tracks for the artist only",
         "prefer_library": "Prefer library, fall back to top",
-        "all_tracks": "All tracks from all providers"
+        "all_tracks": "All of the artist's own tracks from all providers, without covers"
       }
     },
     "default_enqueue_order_artist": {

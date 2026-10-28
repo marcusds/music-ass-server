@@ -103,15 +103,52 @@ async def test_stop_ends_a_foreign_cast_session_right_away(app_id: str | None) -
     assert fake.app_quit_sent is True
 
 
-async def test_stop_on_a_group_leaves_the_app_alone() -> None:
-    """A cast group is released by its power command, not by stop."""
+async def test_stop_on_a_group_schedules_the_release() -> None:
+    """A group whose app keeps running stays powered and keeps capturing its members."""
     fake = _fake_cast(player_type=PlayerType.GROUP)
 
     await _stop(fake)
 
     fake.cc.media_controller.stop.assert_called_once()
     fake.cc.quit_app.assert_not_called()
+    fake.mass.call_later.assert_called_once_with(
+        APP_QUIT_DELAY, fake._quit_app_when_unused, task_id=fake._app_quit_task_id
+    )
+
+
+async def test_stop_on_a_group_ends_a_foreign_cast_session_right_away() -> None:
+    """A session of another app on a group is not ours to keep around either."""
+    fake = _fake_cast(player_type=PlayerType.GROUP, running_app_id="CC32E753")
+
+    await _stop(fake)
+
+    fake.cc.quit_app.assert_called_once()
     fake.mass.call_later.assert_not_called()
+
+
+@pytest.mark.parametrize("app_id", [MASS_APP_ID, APP_MEDIA_RECEIVER])
+async def test_unused_group_receiver_app_is_quit(app_id: str) -> None:
+    """Nothing came along within the grace period, so the group releases its members."""
+    fake = _fake_cast(player_type=PlayerType.GROUP, running_app_id=app_id, player_state="IDLE")
+
+    await _quit_app_when_unused(fake)
+
+    fake.cc.quit_app.assert_called_once()
+    assert fake.app_quit_sent is True
+
+
+async def test_playing_on_a_group_after_stop_cancels_the_release() -> None:
+    """A follow-up play (or announcement) on the group reuses its Cast session."""
+    fake = _fake_cast(player_type=PlayerType.GROUP)
+    fake.config.get_value.return_value = True
+
+    await _stop(fake)
+    await ChromecastPlayer._launch_app(cast("ChromecastPlayer", fake))
+
+    fake.mass.call_later.assert_called_once()
+    fake.mass.cancel_timer.assert_called_once_with(fake._app_quit_task_id)
+    fake.mass.cancel_task.assert_called_once_with(fake._app_quit_task_id)
+    fake.cc.quit_app.assert_not_called()
 
 
 async def test_stop_without_a_media_session_is_not_sent() -> None:

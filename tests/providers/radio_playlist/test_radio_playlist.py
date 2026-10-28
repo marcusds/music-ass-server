@@ -16,12 +16,14 @@ if TYPE_CHECKING:
     from music_assistant import MusicAssistant
 
 
-def _track(item_id: str, duration: int = 200) -> MagicMock:
+def _track(item_id: str, duration: int = 200, version: str = "") -> MagicMock:
     track = MagicMock()
     track.item_id = item_id
     track.provider = "test"
     track.uri = f"test://track/{item_id}"
     track.name = f"Track {item_id}"
+    track.version = version
+    track.artists = []
     track.duration = duration
     track.media_type = MediaType.TRACK
     return track
@@ -205,6 +207,20 @@ async def test_artist_seed_without_top_tracks_falls_back() -> None:
     prov.mass.music.artists.tracks.assert_awaited_once_with("art1", "test", limit=None)
     cast("Any", prov.mass.player_queues.get_tracks_for_playback).assert_not_awaited()
     assert any(t.item_id == "full1" for t in result)
+
+
+@pytest.mark.asyncio
+async def test_artist_seed_leaves_out_covers() -> None:
+    """An artist seed samples its own songs, not the karaoke releases of them."""
+    artist_seed = _seed(MediaType.ARTIST, "art1")
+    prov = _make_provider({}, [])
+    prov.mass.music.artists.top_tracks = AsyncMock(  # type: ignore[method-assign]
+        return_value=[_track("own"), _track("cover", version="Karaoke Version")]
+    )
+
+    result = await prov.get_dynamic_tracks([artist_seed], include_base_tracks=True, target_size=5)
+
+    assert [t.item_id for t in result] == ["own"]
 
 
 @pytest.mark.asyncio

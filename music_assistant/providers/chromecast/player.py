@@ -179,9 +179,9 @@ class ChromecastPlayer(Player):
 
     async def stop(self) -> None:
         """Send STOP command to given player."""
-        if self.type == PlayerType.GROUP:
-            await asyncio.to_thread(self.cc.media_controller.stop)
-            return
+        # a cast group is released the same way: while its app runs, the group counts
+        # as powered and keeps capturing its members, so they could not be played to
+        # on their own until the receiver gives up the session
         if self.cc.app_id not in (MASS_APP_ID, APP_MEDIA_RECEIVER):
             # another app is casting to the device, release it right away
             await self._quit_app()

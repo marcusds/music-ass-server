@@ -935,6 +935,12 @@ async def test_global_search_includes_plugin_providers_with_search() -> None:
     mass.cache.set = AsyncMock(return_value=None)
     plugin_prov = _make_prov("plug_a", ProviderType.PLUGIN, {ProviderFeature.SEARCH})
     mass.get_providers_supporting_feature.return_value = [plugin_prov]
+    music_prov = _make_prov("m_a", ProviderType.MUSIC, {ProviderFeature.SEARCH})
+    mass.get_provider = Mock(
+        side_effect=lambda instance_id, **_kwargs: {"m_a": music_prov, "plug_a": plugin_prov}.get(
+            instance_id
+        )
+    )
 
     controller = MusicController.__new__(MusicController)
     controller.mass = mass
